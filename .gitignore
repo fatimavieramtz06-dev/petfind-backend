@@ -1,0 +1,25 @@
+# Dependencias
+node_modules/
+
+# Configuración local de Vercel
+.vercel/
+
+# Variables de entorno
+.env
+.env.*
+!.env.example
+
+# Credenciales privadas
+*serviceAccount*.json
+*service-account*.json
+*firebase-adminsdk*.json
+*.pem
+*.key
+
+# Respaldos
+respaldos/
+
+# Archivos generados y registros
+dist/
+build/
+*.log

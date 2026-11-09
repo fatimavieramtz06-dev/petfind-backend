@@ -1,0 +1,22 @@
+{
+  "functions": {
+    "api/escanear.js": {
+      "maxDuration": 60
+    },
+    "api/notificar.js": {
+      "maxDuration": 60
+    },
+    "api/reencuentro.js": {
+      "maxDuration": 15
+    },
+    "api/limpiar.js": {
+      "maxDuration": 60
+    }
+  },
+  "crons": [
+    {
+      "path": "/api/limpiar",
+      "schedule": "0 9 * * *"
+    }
+  ]
+}
