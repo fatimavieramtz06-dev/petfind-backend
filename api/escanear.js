@@ -9,6 +9,10 @@ if (!admin.apps.length) {
 const MODELO = process.env.GEMINI_MODEL || 'gemini-3.5-flash';
 const URL_GEMINI = `https://generativelanguage.googleapis.com/v1beta/models/${MODELO}:generateContent`;
 const MAX_CANDIDATOS = 8;
+// Vercel tiene maxDuration=60: deja margen para Firestore y la respuesta HTTP.
+const PRESUPUESTO_TOTAL_MS = 52000;
+const MAX_ESPERA_INTENTO_MS = 48000;
+const MINIMO_REINTENTO_MS = 8000;
 
 function prepararImagen(valor) {
   if (typeof valor !== 'string' || !valor.trim()) throw new Error('Imagen inválida');
@@ -31,22 +35,25 @@ function prepararImagen(valor) {
   return { mime, b64 };
 }
 
-// Dos intentos como máximo; el presupuesto incluye la espera y la lectura de JSON.
+// Un análisis lento dispone de una espera larga. Solo se reintenta si queda tiempo útil.
+// El presupuesto incluye la espera entre intentos y la lectura del cuerpo JSON.
 async function consultarGemini(opciones, limite) {
   for (let intento = 0; intento < 2; intento++) {
     if (intento > 0) {
       const espera = 800 + Math.floor(Math.random() * 400);
-      if (Date.now() + espera + 1000 >= limite) break;
+      if (Date.now() + espera + MINIMO_REINTENTO_MS >= limite) break;
       await new Promise((resolve) => setTimeout(resolve, espera));
     }
     const restante = limite - Date.now();
-    if (restante < 1000) break;
+    if (restante < (intento > 0 ? MINIMO_REINTENTO_MS : 2000)) break;
     const controller = new AbortController();
-    const temporizador = setTimeout(() => controller.abort(), Math.min(22000, restante));
+    const esperaMaxima = Math.min(MAX_ESPERA_INTENTO_MS, restante - 1000);
+    const inicioIntento = Date.now();
+    const temporizador = setTimeout(() => controller.abort(), esperaMaxima);
     try {
       const respuesta = await fetch(URL_GEMINI, { ...opciones, signal: controller.signal });
       if (!respuesta.ok) {
-        console.error('Gemini error', respuesta.status, 'intento', intento + 1);
+        console.error('Gemini error', respuesta.status, 'intento', intento + 1, 'modelo', MODELO, 'duracionMs', Date.now() - inicioIntento);
         // No reintentar errores de credenciales, parámetros ni cuota.
         if ([408, 500, 502, 503, 504].includes(respuesta.status) && intento === 0) {
           if (respuesta.body) await respuesta.body.cancel();
@@ -55,10 +62,12 @@ async function consultarGemini(opciones, limite) {
         return { ok: false, status: respuesta.status };
       }
       // Mantener el temporizador hasta recibir también el cuerpo.
-      return { ok: true, status: respuesta.status, data: await respuesta.json() };
+      const data = await respuesta.json();
+      console.log('Gemini análisis recibido', { modelo: MODELO, intento: intento + 1, duracionMs: Date.now() - inicioIntento });
+      return { ok: true, status: respuesta.status, data };
     } catch (e) {
       if (e?.name !== 'AbortError' && !(e instanceof TypeError)) throw e;
-      console.error('Gemini sin respuesta', e.name, 'intento', intento + 1);
+      console.error('Gemini sin respuesta', e.name, 'intento', intento + 1, 'modelo', MODELO, 'duracionMs', Date.now() - inicioIntento, 'limiteMs', esperaMaxima);
       if (intento === 1) break;
     } finally {
       clearTimeout(temporizador);
@@ -74,7 +83,7 @@ module.exports = async (req, res) => {
   if (req.method === 'OPTIONS') return res.status(204).end();
   if (req.method !== 'POST') return res.status(405).json({ error: 'Método no permitido' });
 
-  const limite = Date.now() + 45000;
+  const limite = Date.now() + PRESUPUESTO_TOTAL_MS;
   const token = (req.headers.authorization || '').replace(/^Bearer\s+/i, '');
   try {
     await admin.auth().verifyIdToken(token);
@@ -124,6 +133,7 @@ module.exports = async (req, res) => {
       'Elige exactamente uno de los tres valores de estadoImagen, sin barras.'
     });
 
+    console.log('Escáner iniciando análisis', { modelo: MODELO, candidatos: candidatos.length, tiempoDisponibleMs: Math.max(0, limite - Date.now()) });
     const respuesta = await consultarGemini({
       method: 'POST',
       headers: { 'Content-Type': 'application/json', 'x-goog-api-key': process.env.GEMINI_API_KEY },
