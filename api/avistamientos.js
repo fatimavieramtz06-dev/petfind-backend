@@ -6,7 +6,18 @@ const hash = (x) => createHash('sha256').update(JSON.stringify(x)).digest('hex')
 const idValido = (x) => typeof x === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(x);
 const fallo = (status, message) => Object.assign(new Error(message), { status });
 const activo = (r) => r.tipo === 'Perdida' && r.estado !== 'Reunida' && r.estado !== 'Vencida';
-const fotoValida = (x) => typeof x === 'string' && (x === '' || (x.length <= 700023 && /^data:image\/(?:jpeg|png);base64,[A-Za-z0-9+/]+={0,2}$/.test(x)));
+const fotoValida = (x) => {
+  if (typeof x !== 'string') return false;
+  if (x === '') return true;
+  if (x.length > 700023) return false;
+
+  const prefijos = ['data:image/jpeg;base64,', 'data:image/png;base64,'];
+  const prefijo = prefijos.find((p) => x.startsWith(p));
+  if (!prefijo) return false;
+
+  const contenido = x.slice(prefijo.length);
+  return /^[A-Za-z0-9+/]+={0,2}$/.test(contenido);
+};
 module.exports = async (req, res) => {
   res.setHeader('Access-Control-Allow-Origin', '*');
   res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
@@ -26,6 +37,27 @@ module.exports = async (req, res) => {
       const resultado = await db.runTransaction(async (tx) => {
         const r = await tx.get(db.collection('reportes').doc(reporteId));
         if (!r.exists) throw fallo(404, 'La publicación ya no existe.');
+        if (req.query.vista === 'cronologia') {
+          if (r.data().autorId !== uid) {
+            const guardado = await tx.get(db.doc(`guardados/${uid}/reportes/${reporteId}`));
+            if (!guardado.exists) throw fallo(403, 'Guarda el reporte para consultar su cronología.');
+          }
+          let eventos = db.collection('avistamientos').where('reporteId', '==', reporteId)
+            .orderBy('fechaEvento', 'desc').orderBy(admin.firestore.FieldPath.documentId(), 'desc')
+            .select('fechaEvento', 'zonaPublica');
+          if (cursor) {
+            const ultimo = await tx.get(db.collection('avistamientos').doc(cursor));
+            if (!ultimo.exists || ultimo.get('reporteId') !== reporteId) throw fallo(400, 'Actualiza la cronología para continuar.');
+            eventos = eventos.startAfter(ultimo.get('fechaEvento'), ultimo.id);
+          }
+          const pagina = (await tx.get(eventos.limit(26))).docs;
+          return {
+            items: pagina.slice(0, 25).map(d => ({
+              id: d.id, fecha: d.get('fechaEvento'), zona: d.get('zonaPublica') || ''
+            })),
+            siguiente: pagina.length > 25 ? pagina[24].id : null
+          };
+        }
         if (r.data().autorId !== uid) throw fallo(403, 'Solo el autor del reporte puede consultar estos avistamientos.');
         let q = db.collection('avistamientos').where('reporteId', '==', reporteId).orderBy(admin.firestore.FieldPath.documentId());
         if (cursor) q = q.startAfter(cursor);
@@ -41,6 +73,8 @@ module.exports = async (req, res) => {
     if (typeof b.referencia !== 'string' || b.referencia.trim().length > 150) throw fallo(400, 'La referencia debe tener hasta 150 caracteres.');
     if (!Number.isFinite(b.latitud) || b.latitud < -90 || b.latitud > 90 || !Number.isFinite(b.longitud) || b.longitud < -180 || b.longitud > 180) throw fallo(400, 'Confirma una ubicación válida en el mapa.');
     if (!fotoValida(b.foto)) throw fallo(400, 'La foto debe ser JPEG o PNG y ocupar menos de 700000 caracteres de imagen. Elige otra foto o envía sin foto.');
+    const zonaPublica = b.zonaPublica ?? '';
+    if (typeof zonaPublica !== 'string' || zonaPublica.length > 80) throw fallo(400, 'La zona compartida admite hasta 80 caracteres.');
     const fecha = typeof b.fechaEvento === 'string' ? Date.parse(b.fechaEvento) : NaN;
     if (!Number.isFinite(fecha) || fecha > Date.now() + 300000 || fecha < Date.now() - 30 * 86400000) throw fallo(400, 'La fecha debe estar dentro de los últimos 30 días y no ser futura.');
     const ref = db.collection('avistamientos').doc(hash([uid, b.reporteId, b.solicitudId]));
@@ -57,7 +91,8 @@ module.exports = async (req, res) => {
       if (Number.isFinite(perdida) && fecha < perdida) throw fallo(400, 'El avistamiento es anterior a la fecha de pérdida del reporte. Revisa cuándo ocurrió.');
       if ((limite.data()?.cantidad || 0) >= 5) throw fallo(429, 'Alcanzaste el límite diario de cinco avistamientos. Intenta más tarde.');
       const ahora = admin.firestore.FieldValue.serverTimestamp();
-      tx.create(ref, { reporteId: b.reporteId, autorUid: uid, comentario: b.comentario.trim(), referencia: b.referencia.trim(), latitud: b.latitud, longitud: b.longitud, fechaEvento: new Date(fecha).toISOString(), foto: b.foto, creado: ahora });
+      tx.update(r.ref, { ultimoAvistamiento: ahora });
+      tx.create(ref, { zonaPublica: zonaPublica.trim(), reporteId: b.reporteId, autorUid: uid, comentario: b.comentario.trim(), referencia: b.referencia.trim(), latitud: b.latitud, longitud: b.longitud, fechaEvento: new Date(fecha).toISOString(), foto: b.foto, creado: ahora });
       tx.set(cuota, { cantidad: (limite.data()?.cantidad || 0) + 1, actualizado: ahora });
       tx.create(db.collection('notificaciones').doc(`avistamiento_${ref.id}`), { paraUid: reporte.autorId, tipo: 'avistamiento', tuReporteId: b.reporteId, tuReporteNombre: String(reporte.nombre || '').slice(0, 60), motivo: 'Alguien informó que vio una mascota parecida. Abre tu reporte para consultar el lugar, la fecha y la foto, si la adjuntó. Es información por verificar.', leida: false, creado: ahora });
       return { ok: true, duplicado: false };
